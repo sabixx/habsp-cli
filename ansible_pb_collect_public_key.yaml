@@ -1,0 +1,184 @@
+---
+- name: Collect public SSH keys (Linux/POSIX)
+  hosts: YOUR_HOSTS
+  gather_facts: false
+  become: true  # read all users' ~/.ssh and system paths on the target
+
+  vars:
+    # Absolute output path on the controller (playbook dir, with safe fallback to $PWD)
+    output_dir: "{{ lookup('env','PWD') }}/hibsp_collected_kyes"
+
+    extra_paths: []
+    pubkey_patterns:
+      - "*.pub"
+      - "authorized_keys"
+      - "authorized_keys2"
+
+    # Search roots (add more via -e 'extra_paths=/opt/keys,/srv/ssh')
+    search_paths: "{{ (['/home','/root','/etc/ssh/authorized_keys.d','/etc/ssh'] + (extra_paths | default([]) | list)) | unique }}"
+
+    # Debug toggles
+    debug_list_files: false
+    debug_sample_extraction: false
+    debug_dump_contents: false   # set true to dump truncated raw contents
+    debug_dump_max_lines: 5
+    debug_dump_max_bytes: 4096
+
+  tasks:
+    - name: Show resolved output directory (controller)
+      ansible.builtin.debug:
+        msg:
+          output_dir_resolved: "{{ output_dir }}"
+
+    - name: Ensure destination directory exists on controller (no sudo)
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Show search configuration (debug)
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          search_paths: "{{ search_paths }}"
+          patterns: "{{ pubkey_patterns }}"
+          extra_paths: "{{ extra_paths }}"
+      when: debug_list_files | bool
+
+    - name: Find candidate public key files (sudo)
+      ansible.builtin.find:
+        paths: "{{ search_paths }}"
+        file_type: file
+        recurse: true
+        patterns: "{{ pubkey_patterns }}"
+        use_regex: false
+        excludes:
+          - "/proc"
+          - "/sys"
+          - "/dev"
+          - "/run"
+      register: found
+
+    - name: Stat each file (owner/perms/readable)
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: false
+      loop: "{{ found.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: file_stats
+
+    - name: Debug file list and sample stats
+      ansible.builtin.debug:
+        msg:
+          total_found: "{{ found.files | length }}"
+          first_8_paths: "{{ (found.files | map(attribute='path') | list)[:8] | default([]) }}"
+          unreadable_paths: "{{ file_stats.results
+                                | selectattr('stat.readable','defined')
+                                | selectattr('stat.readable','equalto', false)
+                                | map(attribute='stat.path') | list }}"
+      when: debug_list_files | bool
+
+    - name: Build unified list of paths
+      ansible.builtin.set_fact:
+        all_files: "{{ found.files | map(attribute='path') | list | unique }}"
+
+    # Optional: dump first N raw lines (for troubleshooting)
+    - name: Debug dump (truncated raw file contents)
+      ansible.builtin.shell: |
+        set -o pipefail
+        f="{{ item }}"
+        if [ ! -r "$f" ]; then
+          echo "SKIP_UNREADABLE $f" 1>&2
+          exit 0
+        fi
+        echo "===== FILE: $f ====="
+        echo "SIZE: $(wc -c <"$f" 2>/dev/null || echo 0) bytes"
+        sed -e 's/\r$//' "$f" | head -c {{ debug_dump_max_bytes }} | head -n {{ debug_dump_max_lines }}
+        echo "===== END: $f ====="
+      args:
+        executable: /bin/bash
+      register: raw_dumps
+      loop: "{{ all_files }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+      changed_when: false
+      when: debug_dump_contents | bool
+
+    - name: Show raw dump sample (first blocks)
+      ansible.builtin.debug:
+        var: raw_dumps.stdout_lines
+      when: debug_dump_contents | bool
+
+    # Extract keys: normalize whitespace, skip comments, handle options-before-key
+    - name: Extract valid public keys from each file (normalize + awk, sudo)
+      ansible.builtin.shell: |
+        set -o pipefail
+        f="{{ item }}"
+        if [ ! -r "$f" ]; then
+          echo "SKIP_UNREADABLE $f" 1>&2
+          exit 0
+        fi
+        sed -e 's/\r$//' "$f" \
+        | sed -E 's/[[:space:]]+/ /g' \
+        | awk '
+            /^[[:space:]]*#/ { next }      # skip full-line comments
+            /^[[:space:]]*$/ { next }      # skip empty
+            {
+              for (i=1; i<=NF; i++) {
+                # include ed25519, ecdsa-*, sk-ssh-*, sk-ecdsa-*
+                if ($i ~ /^(ssh-(rsa|dss|ed25519)|ecdsa-[^[:space:]]+|sk-(ssh|ecdsa)-[^[:space:]]+)$/) {
+                  out=$i
+                  for (j=i+1; j<=NF; j++) out=out" "$j
+                  print out
+                  next
+                }
+              }
+            }'
+      args:
+        executable: /bin/bash
+      register: extracted
+      loop: "{{ all_files }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Debug extraction results per file (sample)
+      ansible.builtin.debug:
+        msg:
+          file: "{{ item.item }}"
+          lines_found: "{{ (item.stdout_lines | default([])) | length }}"
+          sample: "{{ (item.stdout_lines | default([]))[:2] }}"
+          stderr: "{{ item.stderr | default('') }}"
+      loop: "{{ extracted.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('unknown') }}"
+      when: debug_sample_extraction | bool
+
+    - name: Combine and de-duplicate keys (Linux)
+      ansible.builtin.set_fact:
+        collected_public_keys: >-
+          {{ (extracted.results | default([])
+              | map(attribute='stdout_lines') | list
+              | sum(start=[]))
+              | reject('equalto','')
+              | unique | sort | list }}
+
+    - name: Debug totals
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          total_keys: "{{ collected_public_keys | length }}"
+          sample_first_5: "{{ collected_public_keys[:5] | default([]) }}"
+
+    - name: Write per-host public keys to controller (no sudo)
+      ansible.builtin.copy:
+        dest: "{{ output_dir }}/{{ inventory_hostname }}.pubkeys"
+        content: "{{ (collected_public_keys | default([])) | join('\n') ~ '\n' if (collected_public_keys | length) > 0 else '' }}"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
