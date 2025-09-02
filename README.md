@@ -1,3 +1,9 @@
+# Ansible playbook to collect public SSH keys
+
+- 🔍 Collects public SSH keys from (Linux/POSIX)
+- saves them to a destination folder (    output_dir: "{{ lookup('env','PWD') }}/hibsp_collected_kyes"    )
+
+
 # habsp-cli
 
 Small, cross-platform uploader for **HaveIbeenSSHpwned**.  
