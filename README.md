@@ -28,7 +28,7 @@ go build -o habsp-cli .
 
 
 ### Upload with device auth (recommended)
-./habsp-cli device --path ~/.ssh
+./habsp-cli --path ~/.ssh
 
 
 .\habsp-cli-windows-amd64.exe --auth password `
